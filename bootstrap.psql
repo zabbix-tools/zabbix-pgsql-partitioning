@@ -1,0 +1,79 @@
+-- create function to route inserts from parent table to partitions
+CREATE OR REPLACE FUNCTION zbx_route_insert_by_clock()
+	RETURNS TRIGGER AS $$
+	DECLARE
+		schema_name TEXT;
+		time_format	TEXT;
+		table_name	TEXT;
+	BEGIN
+		schema_name	:= TG_ARGV[0];
+		time_format	:= TG_ARGV[1];
+		table_name	:= schema_name || '.' || TG_TABLE_NAME || '_' || TO_CHAR(TO_TIMESTAMP(NEW.clock), time_format);
+
+		EXECUTE 'INSERT INTO ' || table_name || ' SELECT ($1).*;' USING NEW;
+		RETURN NULL;
+	END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION zbx_provision_partitions(
+	schema_name		TEXT
+	, table_name	TEXT
+	, partition_by	TEXT
+	, count			BIGINT
+) RETURNS VOID AS $$
+	DECLARE
+		time_format			TEXT;
+		time_interval		INTERVAL;
+		start_date			INTEGER;
+		end_date			INTEGER;
+		new_table_name		TEXT;
+		new_constraint_name	TEXT;
+		new_trigger_name	TEXT;
+	BEGIN
+		-- set time_format
+		CASE partition_by
+			WHEN 'day'		THEN time_format := 'YYYY_MM_DD';
+			WHEN 'month'	THEN time_format := 'YYYY_MM';
+			WHEN 'year'		THEN time_format := 'YYYY';
+			ELSE RAISE 'Unsupported partition_by value: %', partition_by;
+		END CASE;
+
+		-- compute time interval
+		time_interval := '1 ' || partition_by;
+
+		-- create <count> new partitions
+		FOR i IN 0..(count - 1) LOOP
+			start_date			:= EXTRACT(EPOCH FROM DATE_TRUNC(partition_by, NOW() + (time_interval * i)));
+			end_date			:= EXTRACT(EPOCH FROM DATE_TRUNC(partition_by, NOW() + (time_interval * (i + 1))));
+			new_table_name		:= table_name || '_' || TO_CHAR(NOW() + (time_interval * i), time_format);
+			new_constraint_name	:= new_table_name || '_clock';
+			new_trigger_name	:= table_name || '_insert';
+
+			-- check if table exists
+			BEGIN
+				PERFORM (schema_name || '.' || new_table_name)::regclass;
+				RAISE NOTICE 'partition already exist: %.%', schema_name, new_table_name; 
+
+			EXCEPTION WHEN undefined_table THEN
+				-- create missing table like parent table
+				EXECUTE 'CREATE TABLE ' || schema_name || '.' || new_table_name || ' (
+					LIKE ' || table_name || '
+						INCLUDING DEFAULTS
+						INCLUDING CONSTRAINTS
+						INCLUDING INDEXES
+				) INHERITS (' || table_name || ');';
+
+				-- add clock column constraint
+				EXECUTE 'ALTER TABLE ' || schema_name || '.' || new_table_name
+					|| ' ADD CONSTRAINT ' || new_constraint_name
+					|| ' CHECK ( clock >= ' || start_date || ' AND clock < ' || end_date || ' );';				
+			END;
+
+			-- trigger the routing function on insert in the parent table
+			EXECUTE 'DROP TRIGGER IF EXISTS ' || QUOTE_IDENT(new_trigger_name) || ' ON ' || QUOTE_IDENT(table_name) || ';';
+			EXECUTE 'CREATE TRIGGER ' || QUOTE_IDENT(new_trigger_name) || '
+				BEFORE INSERT ON ' || QUOTE_IDENT(table_name) || '
+				FOR EACH ROW EXECUTE PROCEDURE zbx_route_insert_by_clock(' || QUOTE_IDENT(schema_name) || ', ' || QUOTE_LITERAL(time_format) || ');';
+		END LOOP;
+	END
+$$ LANGUAGE plpgsql;
