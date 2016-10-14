@@ -26,7 +26,7 @@ $$ LANGUAGE plpgsql;
 --
 -- function to provision partition tables in advance
 --
--- table_name:		table to create child partitions for
+-- table_name:		table to create child partitions for (e.g. history)
 -- partition_by:	period per partition [day|month|year] (default: month)
 -- count:			number of partitions to provision, starting from NOW() 
 -- 					(default: 12)
@@ -89,6 +89,8 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 		END LOOP;
 		
 		-- trigger the routing function on insert to the parent table
+		-- TODO: is there a race condition here if a row is inserted BEFORE the
+		-- trigger is recreated? Rows could leak into the parent table.
 		EXECUTE 'DROP TRIGGER IF EXISTS ' || QUOTE_IDENT(new_trigger_name) || ' ON ' || QUOTE_IDENT(table_name) || ';';
 		EXECUTE 'CREATE TRIGGER ' || QUOTE_IDENT(new_trigger_name) || '
 			BEFORE INSERT ON ' || QUOTE_IDENT(table_name) || '
@@ -103,12 +105,16 @@ $$ LANGUAGE plpgsql;
 -- 
 -- WARNING: all insert triggers must be removed from the parent table to ensure
 -- copied rows are inserted into the parent; not back into the child partitions.
+--
+-- You should probably stop the Zabbix server while running this function.
+-- Otherwise new value are inserted into the parent table BEFORE the data is
+-- copied from child tables. Data are then no longer sequential.
 -- 
 -- All child tables are dropped!
 --
 -- table_name:			parent table name
 -- trigger_name:		name of the trigger to be dropped from the parent table
---                      (default: {table_name}_insert)
+-- 						(default: {table_name}_insert)
 -- schema_name:			parent table schema name (default: public)
 --
 CREATE OR REPLACE FUNCTION zbx_deprovision_partitions(
