@@ -1,4 +1,6 @@
--- See: https://www.keithf4.com/table-partitioning-and-foreign-keys/
+-- See: 
+-- https://support.zabbix.com/browse/ZBX-11257
+-- https://www.keithf4.com/table-partitioning-and-foreign-keys/
 
 --
 -- Repair foreign key constraint c_event_recovery_1 on event_recovery

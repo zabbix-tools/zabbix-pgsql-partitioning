@@ -1,4 +1,7 @@
--- create function to route inserts from parent table to partitions
+--
+-- trigger function to route inserts from a parent table to the correct child
+-- partition
+--
 CREATE OR REPLACE FUNCTION zbx_route_insert_by_clock()
 	RETURNS TRIGGER AS $$
 	DECLARE
@@ -6,15 +9,28 @@ CREATE OR REPLACE FUNCTION zbx_route_insert_by_clock()
 		time_format	TEXT;
 		table_name	TEXT;
 	BEGIN
+		-- trigger arguments
 		schema_name	:= TG_ARGV[0];
 		time_format	:= TG_ARGV[1];
-		table_name	:= schema_name || '.' || TG_TABLE_NAME || '_' || TO_CHAR(TO_TIMESTAMP(NEW.clock), time_format);
+
+		-- compute destination partition by appending NEW.clock to the original
+		-- table name, formatted as time_format
+		table_name := schema_name || '.' || TG_TABLE_NAME || '_'
+			|| TO_CHAR(TO_TIMESTAMP(NEW.clock), time_format);
 
 		EXECUTE 'INSERT INTO ' || table_name || ' SELECT ($1).*;' USING NEW;
 		RETURN NULL;
 	END;
 $$ LANGUAGE plpgsql;
 
+--
+-- function to provision partition tables in advance
+--
+-- schema_name:		target schema where partitions are stored
+-- table_name:		table to create child partitions for
+-- partition_by:	period per partition [day|month|year]
+-- count:			number of partitions to provision, starting from NOW()
+--
 CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 	schema_name		TEXT
 	, table_name	TEXT
@@ -30,7 +46,7 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 		new_constraint_name	TEXT;
 		new_trigger_name	TEXT;
 	BEGIN
-		-- set time_format
+		-- set time_format, used to format the partition suffix
 		CASE partition_by
 			WHEN 'day'		THEN time_format := 'YYYY_MM_DD';
 			WHEN 'month'	THEN time_format := 'YYYY_MM';
@@ -38,7 +54,7 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 			ELSE RAISE 'Unsupported partition_by value: %', partition_by;
 		END CASE;
 
-		-- compute time interval
+		-- compute time interval for partition period
 		time_interval := '1 ' || partition_by;
 
 		-- create <count> new partitions
@@ -55,7 +71,7 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 				RAISE NOTICE 'partition already exist: %.%', schema_name, new_table_name; 
 
 			EXCEPTION WHEN undefined_table THEN
-				-- create missing table like parent table
+				-- create missing table, copying schema from parent table
 				EXECUTE 'CREATE TABLE ' || schema_name || '.' || new_table_name || ' (
 					LIKE ' || table_name || '
 						INCLUDING DEFAULTS
@@ -68,12 +84,80 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 					|| ' ADD CONSTRAINT ' || new_constraint_name
 					|| ' CHECK ( clock >= ' || start_date || ' AND clock < ' || end_date || ' );';				
 			END;
-
-			-- trigger the routing function on insert in the parent table
-			EXECUTE 'DROP TRIGGER IF EXISTS ' || QUOTE_IDENT(new_trigger_name) || ' ON ' || QUOTE_IDENT(table_name) || ';';
-			EXECUTE 'CREATE TRIGGER ' || QUOTE_IDENT(new_trigger_name) || '
-				BEFORE INSERT ON ' || QUOTE_IDENT(table_name) || '
-				FOR EACH ROW EXECUTE PROCEDURE zbx_route_insert_by_clock(' || QUOTE_IDENT(schema_name) || ', ' || QUOTE_LITERAL(time_format) || ');';
 		END LOOP;
+		
+		-- trigger the routing function on insert to the parent table
+		EXECUTE 'DROP TRIGGER IF EXISTS ' || QUOTE_IDENT(new_trigger_name) || ' ON ' || QUOTE_IDENT(table_name) || ';';
+		EXECUTE 'CREATE TRIGGER ' || QUOTE_IDENT(new_trigger_name) || '
+			BEFORE INSERT ON ' || QUOTE_IDENT(table_name) || '
+			FOR EACH ROW EXECUTE PROCEDURE zbx_route_insert_by_clock(' || QUOTE_IDENT(schema_name) || ', ' || QUOTE_LITERAL(time_format) || ');';
+	END
+$$ LANGUAGE plpgsql;
+
+--
+-- function to constraint a child partition table by the minimum and maximum ID
+-- this means it won't be scanned for ids that are out of range.
+-- 
+-- WARNING: do no apply to table that will still be appended to
+--
+-- table_name:	child table to constraint (including schema prefix)
+--
+CREATE OR REPLACE FUNCTION zbx_constraint_table_by_id(
+	table_name		TEXT
+	, column_name	TEXT
+) RETURNS VOID AS $$
+	DECLARE
+		min_id	BIGINT;
+		max_id	BIGINT;
+	BEGIN
+		EXECUTE 'SELECT MAX(' || column_name || '), MIN(' || column_name || ') INTO min_id, max_id FROM ' || table_name;
+		RAISE NOTICE 'Got: % %', max_id, min_id;
+	END
+$$ LANGUAGE plpgsql;
+
+--
+-- function to 'unpartition' a table by copying data from all child partitions
+-- into the parent table, deleting the partitions and removing the partitioning
+-- triggers.
+--
+-- schema_name:			parent table schema
+-- table_name:			parent table in the public schema
+--
+CREATE OR REPLACE FUNCTION zbx_deprovision_partitions(
+	schema_name		TEXT
+	, table_name	TEXT
+) RETURNS VOID AS $$
+	DECLARE
+		child		RECORD;
+		ins_count	INTEGER DEFAULT 0;
+	BEGIN
+		-- delete the insert trigger on the parent table
+		EXECUTE 'DROP TRIGGER IF EXISTS partition_zabbix ON ' || schema_name || '.' || table_name || ' CASCADE;';
+		EXECUTE 'DROP TRIGGER IF EXISTS ' || table_name || '_insert ON ' || schema_name || '.' || table_name || ' CASCADE;';
+
+		-- loop through child tables
+		FOR child IN (
+			SELECT 
+				n.nspname	AS schema_name
+				, c.relname	AS table_name
+			FROM pg_inherits i
+			JOIN pg_class c ON i.inhrelid = c.oid
+			JOIN pg_namespace n ON c.relnamespace = n.oid
+			WHERE i.inhparent = table_name::regclass
+			ORDER BY c.relname ASC --sort by name so we insert oldest first
+		) LOOP
+			-- copy content into parent table
+			EXECUTE 'INSERT INTO ' || schema_name || '.' || table_name || ' SELECT * FROM ONLY ' || child.schema_name || '.' || child.table_name;
+
+			-- notify
+			GET DIAGNOSTICS ins_count := ROW_COUNT;
+			RAISE NOTICE 'Copied % rows from %.%', ins_count, child.schema_name, child.table_name;
+
+			-- drop partition
+			EXECUTE 'DROP TABLE ' || child.schema_name || '.' || child.table_name || ';';
+		END LOOP;
+
+		-- update stats for parent table
+		EXECUTE 'ANALYZE ' || schema_name || '.' || table_name || ';';
 	END
 $$ LANGUAGE plpgsql;
