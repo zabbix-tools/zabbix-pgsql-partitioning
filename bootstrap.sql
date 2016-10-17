@@ -8,6 +8,11 @@
 -- WARNING:	For safety, only call functions from this script when the Zabbix
 -- 			server is not running. This will ensure new records do not leak into
 -- 			incorrect table while partitioning schema changes are in process.
+--
+-- WARNING:	This script assumes all partitions are managed by this script. Any
+-- 			configurations changes made outside these functions may result in
+-- 			data loss.
+--
 
 --
 -- View to show all partitions and their parents
@@ -55,6 +60,9 @@ $$ LANGUAGE plpgsql;
 -- partition. This function is called on INSERT by any table that has been
 -- partitioned with zbx_provision_partitions().
 --
+-- To prevent data loss the trigger will pass control back to the caller if any
+-- exception occurs when routing to the child partition.
+--
 CREATE OR REPLACE FUNCTION zbx_route_insert_by_clock()
 	RETURNS TRIGGER AS $$
 	DECLARE
@@ -71,8 +79,16 @@ CREATE OR REPLACE FUNCTION zbx_route_insert_by_clock()
 		table_name := schema_name || '.' || TG_TABLE_NAME || '_'
 			|| TO_CHAR(TO_TIMESTAMP(NEW.clock), time_format);
 
-		EXECUTE 'INSERT INTO ' || table_name || ' SELECT ($1).*;' USING NEW;
-		RETURN NULL;
+		BEGIN
+			-- attempt insert
+			EXECUTE 'INSERT INTO ' || table_name || ' SELECT ($1).*;' USING NEW;
+			RETURN NULL;
+
+		EXCEPTION WHEN OTHERS THEN
+			-- pass control back on error
+			RAISE WARNING 'Error inserting new record into %', table_name;
+			RETURN NEW;
+		END;
 	END;
 $$ LANGUAGE plpgsql;
 
