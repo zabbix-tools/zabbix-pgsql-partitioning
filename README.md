@@ -2,6 +2,22 @@
 
 Scripts for partitioning the Zabbix database on PostgreSQL.
 
+### Repair `c_event_recovery_1` on Zabbix 3.2+
+
+The following is only valid if your `events` table is partitioned prior to
+upgrading to Zabbix v3.2+.
+
+* Stop the Zabbix server when you see the following log entry:
+      
+      query failed: [0] PGRES_FATAL_ERROR:ERROR:  insert or update on table "event_recovery" violates foreign key constraint "c_event_recovery_1"
+
+* Run the repair script:
+    
+      $ psql -U zabbix -d zabbix < repair-zabbix-3.2.0.sql
+
+* Restart Zabbix server to resume database upgrade
+* Email author gratitude or grudge
+
 ### Install management functions
 
     $ psql -U zabbix -d zabbix < bootstrap.sql
