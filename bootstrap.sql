@@ -1,6 +1,59 @@
+--------------------------------------------------------------------------------
+--                Zabbix Partitioning functions for PostgreSQL                --
+--------------------------------------------------------------------------------
 --
--- trigger function to route inserts from a parent table to the correct child
--- partition
+-- This script installs functions to a Zabbix PostgreSQL database to assist in
+-- managing partitions.
+--
+-- WARNING:	For safety, only call functions from this script when the Zabbix
+-- 			server is not running. This will ensure new records do not leak into
+-- 			incorrect table while partitioning schema changes are in process.
+
+--
+-- View to show all partitions and their parents
+--
+CREATE OR REPLACE VIEW zbx_partitions AS
+	SELECT
+		inhparent		AS parent_oid
+		, pn.nspname	AS parent_nspname
+		, pc.relname	AS parent_relname
+		, inhrelid		AS child_oid
+		, cn.nspname	AS child_nspname
+		, cc.relname	AS child_relname
+	FROM pg_inherits i
+	JOIN pg_class pc 		ON i.inhparent = pc.oid
+	JOIN pg_namespace pn	ON pc.relnamespace = pn.oid
+	JOIN pg_class cc		ON i.inhrelid = cc.oid
+	JOIN pg_namespace cn	ON cc.relnamespace = cn.oid
+	ORDER BY cc.relname ASC;
+
+--
+-- Return the time format used to suffix child partitions when partitioning by
+-- partition_by.
+--
+-- partition_by:	period per partition [day|month|year] (default: month)
+--
+CREATE OR REPLACE FUNCTION zbx_time_format_by(
+	partition_by	TEXT
+) RETURNS varchar AS $$
+	DECLARE
+		time_format	TEXT;
+	BEGIN
+		CASE partition_by
+			WHEN 'day'		THEN time_format := 'YYYY_MM_DD';
+			WHEN 'month'	THEN time_format := 'YYYY_MM';
+			WHEN 'year'		THEN time_format := 'YYYY';
+			ELSE RAISE 'Unsupported partition_by value: %', partition_by;
+		END CASE;
+
+		RETURN time_format;
+	END
+$$ LANGUAGE plpgsql;
+
+--
+-- Trigger function to route inserts from a parent table to the correct child
+-- partition. This function is called on INSERT by any table that has been
+-- partitioned with zbx_provision_partitions().
 --
 CREATE OR REPLACE FUNCTION zbx_route_insert_by_clock()
 	RETURNS TRIGGER AS $$
@@ -24,7 +77,8 @@ CREATE OR REPLACE FUNCTION zbx_route_insert_by_clock()
 $$ LANGUAGE plpgsql;
 
 --
--- function to provision partition tables in advance
+-- Configure a table for partitioning by `clock` column and provision partitions
+-- in advance.
 --
 -- table_name:		table to create child partitions for (e.g. history)
 -- partition_by:	period per partition [day|month|year] (default: month)
@@ -49,12 +103,7 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 		new_trigger_name	TEXT;
 	BEGIN
 		-- set time_format, used to format the partition suffix
-		CASE partition_by
-			WHEN 'day'		THEN time_format := 'YYYY_MM_DD';
-			WHEN 'month'	THEN time_format := 'YYYY_MM';
-			WHEN 'year'		THEN time_format := 'YYYY';
-			ELSE RAISE 'Unsupported partition_by value: %', partition_by;
-		END CASE;
+		time_format := (SELECT zbx_time_format_by(partition_by));
 
 		-- compute time interval for partition period
 		time_interval := '1 ' || partition_by;
@@ -99,9 +148,9 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 $$ LANGUAGE plpgsql;
 
 --
--- function to 'unpartition' a table by copying data from all child partitions
--- into the parent table, deleting the partitions and removing the partitioning
--- triggers.
+-- Remove partition configuration from a table by copying data from all child
+-- partitions into the parent table, deleting the partitions and removing the
+-- partitioning triggers.
 -- 
 -- WARNING: all insert triggers must be removed from the parent table to ensure
 -- copied rows are inserted into the parent; not back into the child partitions.
@@ -109,6 +158,10 @@ $$ LANGUAGE plpgsql;
 -- You should probably stop the Zabbix server while running this function.
 -- Otherwise new value are inserted into the parent table BEFORE the data is
 -- copied from child tables. Data are then no longer sequential.
+--
+-- This function also assumes that all child partitions are ordered both
+-- chronologically and alphanumerically so that data is copied in the correct
+-- order.
 -- 
 -- All child tables are dropped!
 --
@@ -135,25 +188,22 @@ CREATE OR REPLACE FUNCTION zbx_deprovision_partitions(
 		EXECUTE 'DROP TRIGGER ' || trigger_name || ' ON ' || schema_name || '.' || table_name || ' CASCADE;';
 
 		-- loop through child tables
-		FOR child IN (
-			SELECT 
-				n.nspname	AS schema_name
-				, c.relname	AS table_name
-			FROM pg_inherits i
-			JOIN pg_class c ON i.inhrelid = c.oid
-			JOIN pg_namespace n ON c.relnamespace = n.oid
-			WHERE i.inhparent = table_name::regclass
-			ORDER BY c.relname ASC --sort by name so we insert oldest first
+		FOR child IN ( 
+			SELECT *
+			FROM zbx_partitions
+			WHERE
+				parent_relname = table_name
+				AND parent_nspname = schema_name
 		) LOOP
 			-- copy content into parent table
-			EXECUTE 'INSERT INTO ' || schema_name || '.' || table_name || ' SELECT * FROM ONLY ' || child.schema_name || '.' || child.table_name;
+			EXECUTE 'INSERT INTO ' || schema_name || '.' || table_name || ' SELECT * FROM ONLY ' || child.child_nspname || '.' || child.child_relname;
 			GET DIAGNOSTICS ins_count := ROW_COUNT;
 			
 			-- drop partition
-			EXECUTE 'DROP TABLE ' || child.schema_name || '.' || child.table_name || ';';
+			EXECUTE 'DROP TABLE ' || child.child_nspname || '.' || child.child_relname || ';';
 
 			-- notify
-			RAISE NOTICE 'Copied % rows from %.%', ins_count, child.schema_name, child.table_name;
+			RAISE NOTICE 'Copied % rows from %.%', ins_count, child.child_nspname, child.child_relname;
 		END LOOP;
 
 		-- update stats for parent table
@@ -162,11 +212,15 @@ CREATE OR REPLACE FUNCTION zbx_deprovision_partitions(
 $$ LANGUAGE plpgsql;
 
 --
--- function to constrain a child partition table by the minimum and maximum id
+-- Constrain a superceded child partition table by the minimum and maximum id.
 --
--- stops a partition being scanned for ids that are out of range.
+-- Improves performance on lookups by ID by stopping old partitions from being
+-- scanned for values that are out of range.
 -- 
--- WARNING: do no apply to a table that will still be appended to
+-- WARNING: Do no apply to a table that will still be appended to
+--
+-- To undo: 
+--   `ALTER TABLE {table_name} DROP CONSTRAINT {table_name}_{column_name};`
 --
 -- table_name:	child table to constrain
 -- column_name:	numeric ID column to constrain by
@@ -197,5 +251,73 @@ CREATE OR REPLACE FUNCTION zbx_constrain_partition(
 			|| ' CHECK ( ' || column_name || ' >= ' || min_id || ' AND ' || column_name || ' <= ' || max_id || ' );';
 
 		RAISE NOTICE 'Added constraint % ( % >= % <= % )', new_constraint_name, min_id, column_name, max_id;
+	END
+$$ LANGUAGE plpgsql;
+
+--
+-- Drop old partitions for the given parent table.
+-- 
+-- The age of a partition is evaluated by parsing the timestamp suffix (e.g.
+-- '..._2016_10_17'). If the upper bound timestamp (not the lower bound suffix)
+-- of the partition is older than the given cutoff timestamp, the partition is
+-- deleted.
+-- 
+-- The upperbound is computed by assuming that all partitions ending in '_YYYY'
+-- contain one year of data, '_YYYY_MM' contains one month, '_YYYY_MM_DD'
+-- contains one day, etc.
+--
+-- Partitions with an upper bound in the future are protected from being
+-- dropped.
+--
+-- table_name:	parent table to drop partitions for
+-- cutoff:		timestamp of the oldest partition to retain
+-- schema_name:	schema where parent table exists (default: public)
+--
+CREATE OR REPLACE FUNCTION zbx_drop_old_partitions(
+	table_name		TEXT
+	, cutoff		TIMESTAMP WITH TIME ZONE
+	, schema_name	TEXT	DEFAULT 'public'
+) RETURNS VOID AS $$
+	DECLARE
+		child			RECORD;
+		child_bound		TIMESTAMP;
+		child_date		RECORD;
+	BEGIN
+		-- loop through each child partition
+		FOR child IN ( 
+			SELECT * FROM zbx_partitions
+			WHERE
+				parent_relname		= table_name
+				AND parent_nspname	= schema_name
+		) LOOP
+			-- extract date component from partition suffix
+			SELECT 
+				SUBSTRING(child.child_relname FROM '\d{4}$')				AS by_year
+				, SUBSTRING(child.child_relname FROM '\d{4}_\d{2}$')		AS by_month
+				, SUBSTRING(child.child_relname FROM '\d{4}_\d{2}_\d{2}$')	AS by_day
+			INTO child_date;
+
+			-- calculate upper bound timestamp of partition
+			IF child_date.by_day <> '' THEN
+				child_bound := TO_TIMESTAMP(child_date.by_day, 'YYYY_MM_DD') + '1 day'::INTERVAL;
+			ELSIF child_date.by_month <> '' THEN
+				child_bound := TO_TIMESTAMP(child_date.by_month, 'YYYY_MM') + '1 month'::INTERVAL;
+			ELSIF child_date.by_year <> '' THEN
+				child_bound := TO_TIMESTAMP(child_date.by_year, 'YYYY') + '1 year'::INTERVAL;
+			ELSE
+				RAISE 'Unsupported partition date suffix: %.%', child.child_nspname, child.child_relname;
+			END IF;
+
+			-- protect current partition
+			IF NOW() < child_bound THEN
+				RAISE 'Current timestamp is earlier than upper bound for partition %.%', child.child_nspname, child.child_relname;
+			END IF;
+
+			-- drop table if upper bound is older than cutoff date
+			IF child_bound <= cutoff THEN
+				EXECUTE 'DROP TABLE ' || child.child_nspname || '.' || child.child_relname || ';';
+				RAISE NOTICE 'Dropped partition: %.%', child.child_nspname, child.child_relname;
+			END IF;
+		END LOOP;
 	END
 $$ LANGUAGE plpgsql;
