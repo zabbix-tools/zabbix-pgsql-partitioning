@@ -2,6 +2,40 @@
 
 Scripts for partitioning the Zabbix database on PostgreSQL.
 
+### Install management functions
+
+    $ psql -U zabbix -d zabbix < bootstrap.sql
+
+### Partition a table
+
+```sql
+-- configure history table for partitioning and provision 14 days of
+-- partitions
+SELECT zbx_provision_partitions('history', 'day', 14);
+```
+
+### Unpartition a table
+
+```sql
+-- remove partition configuration, migrate data into parent table and
+-- drop child partitions for 'history' table
+SELECT zbx_deprovision_partitions('history');
+```
+
+### Optimize superceded partition
+
+```sql
+-- add constraint to old 'events' partition by min and max 'eventid'
+SELECT zbx_constrain_partition('events_2015', 'eventid');
+```
+
+### Drop old partitions
+
+```sql
+-- drop history partitions older than Jan 1, 2015
+SELECT zbx_drop_old_partitions('history', '2015-01-01'::TIMESTAMP);
+```
+
 ## License
 
 Copyright (c) 2016 Ryan Armstrong
