@@ -40,6 +40,22 @@ See [ZBX-11257](https://support.zabbix.com/browse/ZBX-11257).
 * Restart Zabbix server to resume database upgrade
 * Email author gratitude or grudge
 
+### Create partition schema
+
+Partitioning results in a large number of tables - ever increasing over time.
+To simplify management, these tables should be isolated from standard Zabbix
+tables using a separate schema. By default, tables will be stored in the
+`public` schema. The scripts in this repo assume all partition tables will be
+stored instead in a schema named `partitions`, though this can be configured
+using the `schema_name` parameter of most script functions.
+
+Create the schema with the following SQL query:
+
+```sql
+-- replace 'zabbix' with the name of your zabbix database role
+CREATE SCHEMA partitions AUTHORIZATION zabbix;
+```
+
 ### Install partitioning functions
 
     $ psql -U zabbix -d zabbix < bootstrap.sql
