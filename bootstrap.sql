@@ -98,7 +98,7 @@ $$ LANGUAGE plpgsql;
 --
 -- table_name:		table to create child partitions for (e.g. history)
 -- partition_by:	period per partition [day|month|year] (default: month)
--- count:			number of partitions to provision, starting from NOW() 
+-- count:			number of partitions to provision, starting from NOW()
 -- 					(default: 12)
 -- schema_name:		target schema where partitions are stored
 -- 					(default: partitions)
@@ -135,7 +135,7 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 			-- check if table exists
 			BEGIN
 				PERFORM (schema_name || '.' || new_table_name)::regclass;
-				RAISE NOTICE 'partition already exist: %.%', schema_name, new_table_name; 
+				RAISE NOTICE 'partition already exist: %.%', schema_name, new_table_name;
 
 			EXCEPTION WHEN undefined_table THEN
 				-- create missing table, copying schema from parent table
@@ -149,10 +149,10 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 				-- add clock column constraint
 				EXECUTE 'ALTER TABLE ' || schema_name || '.' || new_table_name
 					|| ' ADD CONSTRAINT ' || new_constraint_name
-					|| ' CHECK ( clock >= ' || start_date || ' AND clock < ' || end_date || ' );';				
+					|| ' CHECK ( clock >= ' || start_date || ' AND clock < ' || end_date || ' );';
 			END;
 		END LOOP;
-		
+
 		-- trigger the routing function on insert to the parent table
 		-- TODO: is there a race condition here if a row is inserted BEFORE the
 		-- trigger is recreated? Rows could leak into the parent table.
@@ -167,7 +167,7 @@ $$ LANGUAGE plpgsql;
 -- Remove partition configuration from a table by copying data from all child
 -- partitions into the parent table, deleting the partitions and removing the
 -- partitioning triggers.
--- 
+--
 -- WARNING: all insert triggers must be removed from the parent table to ensure
 -- copied rows are inserted into the parent; not back into the child partitions.
 --
@@ -178,7 +178,7 @@ $$ LANGUAGE plpgsql;
 -- This function also assumes that all child partitions are ordered both
 -- chronologically and alphanumerically so that data is copied in the correct
 -- order.
--- 
+--
 -- All child tables are dropped!
 --
 -- table_name:			parent table name
@@ -196,7 +196,7 @@ CREATE OR REPLACE FUNCTION zbx_deprovision_partitions(
 		ins_count	INTEGER DEFAULT 0;
 	BEGIN
 		-- default trigger name
-		IF trigger_name = '' THEN 
+		IF trigger_name = '' THEN
 			trigger_name = table_name || '_insert';
 		END IF;
 
@@ -204,7 +204,7 @@ CREATE OR REPLACE FUNCTION zbx_deprovision_partitions(
 		EXECUTE 'DROP TRIGGER ' || trigger_name || ' ON ' || schema_name || '.' || table_name || ' CASCADE;';
 
 		-- loop through child tables
-		FOR child IN ( 
+		FOR child IN (
 			SELECT *
 			FROM zbx_partitions
 			WHERE
@@ -214,7 +214,7 @@ CREATE OR REPLACE FUNCTION zbx_deprovision_partitions(
 			-- copy content into parent table
 			EXECUTE 'INSERT INTO ' || schema_name || '.' || table_name || ' SELECT * FROM ONLY ' || child.child_nspname || '.' || child.child_relname;
 			GET DIAGNOSTICS ins_count := ROW_COUNT;
-			
+
 			-- drop partition
 			EXECUTE 'DROP TABLE ' || child.child_nspname || '.' || child.child_relname || ';';
 
@@ -232,10 +232,10 @@ $$ LANGUAGE plpgsql;
 --
 -- Improves performance on lookups by ID by stopping old partitions from being
 -- scanned for values that are out of range.
--- 
+--
 -- WARNING: Do no apply to a table that will still be appended to
 --
--- To undo: 
+-- To undo:
 --   `ALTER TABLE {table_name} DROP CONSTRAINT {table_name}_{column_name};`
 --
 -- table_name:	child table to constrain
@@ -272,12 +272,12 @@ $$ LANGUAGE plpgsql;
 
 --
 -- Drop old partitions for the given parent table.
--- 
+--
 -- The age of a partition is evaluated by parsing the timestamp suffix (e.g.
 -- '..._2016_10_17'). If the upper bound timestamp (not the lower bound suffix)
 -- of the partition is older than the given cutoff timestamp, the partition is
 -- deleted.
--- 
+--
 -- The upperbound is computed by assuming that all partitions ending in '_YYYY'
 -- contain one year of data, '_YYYY_MM' contains one month, '_YYYY_MM_DD'
 -- contains one day, etc.
@@ -300,14 +300,14 @@ CREATE OR REPLACE FUNCTION zbx_drop_old_partitions(
 		child_date		RECORD;
 	BEGIN
 		-- loop through each child partition
-		FOR child IN ( 
+		FOR child IN (
 			SELECT * FROM zbx_partitions
 			WHERE
 				parent_relname		= table_name
 				AND parent_nspname	= schema_name
 		) LOOP
 			-- extract date component from partition suffix
-			SELECT 
+			SELECT
 				SUBSTRING(child.child_relname FROM '\d{4}$')				AS by_year
 				, SUBSTRING(child.child_relname FROM '\d{4}_\d{2}$')		AS by_month
 				, SUBSTRING(child.child_relname FROM '\d{4}_\d{2}_\d{2}$')	AS by_day
