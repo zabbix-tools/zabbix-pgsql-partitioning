@@ -324,15 +324,15 @@ CREATE OR REPLACE FUNCTION zbx_drop_old_partitions(
 				RAISE 'Unsupported partition date suffix: %.%', child.child_nspname, child.child_relname;
 			END IF;
 
-			-- protect current partition
-			IF NOW() < child_bound THEN
-				RAISE 'Current timestamp is earlier than upper bound for partition %.%', child.child_nspname, child.child_relname;
-			END IF;
-
-			-- drop table if upper bound is older than cutoff date
 			IF child_bound <= cutoff THEN
-				EXECUTE 'DROP TABLE ' || child.child_nspname || '.' || child.child_relname || ';';
-				RAISE NOTICE 'Dropped partition: %.%', child.child_nspname, child.child_relname;
+				IF NOW() < child_bound THEN
+					-- protect current partition
+					RAISE NOTICE 'Zabbix can still write to partition %.% - Skipping', child.child_nspname, child.child_relname;
+				ELSE
+					-- drop table if upper bound is older than cutoff date
+					EXECUTE 'DROP TABLE ' || child.child_nspname || '.' || child.child_relname || ';';
+					RAISE NOTICE 'Dropped partition: %.%', child.child_nspname, child.child_relname;
+				END IF;
 			END IF;
 		END LOOP;
 	END
