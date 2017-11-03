@@ -139,13 +139,13 @@ CREATE OR REPLACE FUNCTION zbx_provision_partitions(
 
 			EXCEPTION WHEN undefined_table THEN
 				-- create missing table, copying schema from parent table
-				EXECUTE 'CREATE TABLE ' || schema_name || '.' || new_table_name || ' (
-					LIKE ' || table_name || '
-						INCLUDING DEFAULTS
-						INCLUDING CONSTRAINTS
-						INCLUDING INDEXES
-				) INHERITS (' || table_name || ');';
-
+                                EXECUTE 'CREATE TABLE ' || schema_name || '.' || new_table_name || ' (
+                                        LIKE ' || table_name || '
+                                                INCLUDING DEFAULTS
+                                                INCLUDING CONSTRAINTS
+                                                INCLUDING INDEXES);';
+                                -- add inheritance
+                                EXECUTE 'ALTER TABLE ' || schema_name || '.' || new_table_name || ' INHERIT ' || table_name || ';';
 				-- add clock column constraint
 				EXECUTE 'ALTER TABLE ' || schema_name || '.' || new_table_name
 					|| ' ADD CONSTRAINT ' || new_constraint_name
